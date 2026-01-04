@@ -1,4 +1,4 @@
-# 📚 boox-uploader-cli
+# 📚 BooxServe
 
 > A fast and easy command-line tool to upload files to your Boox device over the local network.
 
