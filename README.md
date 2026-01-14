@@ -17,8 +17,7 @@ go run ./cmd/boox-serve
 
 Build a binary:
 
-<<<<<<< HEAD
-=======
+
 ```bash
 go build ./cmd/boox-serve
 ```
@@ -98,4 +97,3 @@ go test ./...
 
 - Cover previews require a Kitty-compatible terminal (Kitty, Ghostty, etc.).
 - MangaDex API keys can be set in config or via `BOOX_MANGADEX_API_KEY`.
->>>>>>> 42d59aa (Updated README)
