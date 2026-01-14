@@ -955,7 +955,6 @@ func (model model) mangaCoverPanel(result MangaSearchResult, width int) string {
 	}
 
 	lines = append(lines, render+"\n"+placeholder)
-	lines = append(lines, secondaryStyle.Render("Thumbnail: 256px"))
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
 	return panelStyle.Width(width).Render(content)
@@ -1177,7 +1176,7 @@ func (model *model) selectedCoverURL() string {
 }
 
 func coverTransitionCmd() tea.Cmd {
-	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
+	return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg {
 		return coverTransitionMsg{}
 	})
 }
