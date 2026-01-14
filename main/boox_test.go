@@ -1,27 +1,37 @@
 package main
 
-import (
-	"fmt"
-	"log"
-	"testing"
+import "testing"
 
-	"github.com/go-ping/ping"
-)
+func TestConfigBaseURLWithExplicitURL(t *testing.T) {
+	cfg := Config{BooxURL: "http://192.168.1.10:8085", BooxPort: 8085}
 
-func TestBooxConnnection(*testing.T) {
-	var config = create_config()
-	boox_ip := config.boox_ip
-	pinger, err := ping.NewPinger(boox_ip)
+	baseURL, err := cfg.BaseURL()
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("expected no error, got %v", err)
 	}
-	pinger.Count = 3
-	pinger.Run()
+
+	if baseURL != "http://192.168.1.10:8085" {
+		t.Fatalf("unexpected base URL: %s", baseURL)
+	}
+}
+
+func TestConfigBaseURLFromIP(t *testing.T) {
+	cfg := Config{BooxIP: "192.168.1.5", BooxPort: 8085}
+
+	baseURL, err := cfg.BaseURL()
 	if err != nil {
-		panic(err)
+		t.Fatalf("expected no error, got %v", err)
 	}
-	stats := pinger.Statistics()
 
-	fmt.Println(stats)
+	if baseURL != "http://192.168.1.5:8085" {
+		t.Fatalf("unexpected base URL: %s", baseURL)
+	}
+}
 
+func TestConfigBaseURLRequiresValue(t *testing.T) {
+	cfg := Config{BooxPort: 8085}
+
+	if _, err := cfg.BaseURL(); err == nil {
+		t.Fatalf("expected error when no URL or IP is set")
+	}
 }

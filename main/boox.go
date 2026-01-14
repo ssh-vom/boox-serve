@@ -2,28 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 )
-
-type Routes struct {
-	Library  string
-	Images   string
-	Recent   string
-	Music    string
-	Audios   string
-	Download string
-	Storage  string
-	Device   string
-	Upload   string
-}
 
 type DeviceDetails struct {
 	Host         string `json:"host"`
@@ -58,119 +44,87 @@ type LibraryQueryParams struct {
 	LibraryUniqueID string
 }
 
-func getBooxURL() string {
-	config := create_config()
-	return config.boox_url
+type FolderCreationRequest struct {
+	Parent interface{} `json:"parent"`
+	Name   string      `json:"name"`
 }
 
-func getRoutes(url string) Routes {
-
-	libraryRoute := url + "/api/library"
-	imagesRoute := url + "/#/pc/image"
-	recentRoute := url + "/#/pc/recent"
-	musicRoute := url + "/#/pc/music"
-	audiosRoute := url + "/#/pc/audio"
-	downloadRoute := url + "/#/pc/download"
-	storageRoute := url + "/api/storage"
-	deviceRoute := url + "/api/device"
-	uploadRoute := libraryRoute + "/upload"
-
-	return Routes{
-		Library:  libraryRoute,
-		Images:   imagesRoute,
-		Recent:   recentRoute,
-		Music:    musicRoute,
-		Audios:   audiosRoute,
-		Download: downloadRoute,
-		Storage:  storageRoute,
-		Device:   deviceRoute,
-		Upload:   uploadRoute,
-	}
-
+type FolderCreationResponse struct {
+	ID string `json:"id"`
 }
 
-func getBooxDetails() {
-	url := getBooxURL()
-	fmt.Println("URL", url)
-	deviceRoute := getRoutes(url).Device
-	resp, err := http.Get(deviceRoute)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
+type BooxClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
 
-	body, err := io.ReadAll(resp.Body)
+func NewBooxClient(cfg Config, httpClient *http.Client) (*BooxClient, error) {
+	baseURL, err := cfg.BaseURL()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
+
+	if httpClient == nil {
+		httpClient = newHTTPClient()
+	}
+
+	return &BooxClient{baseURL: baseURL, httpClient: httpClient}, nil
+}
+
+func (client *BooxClient) CheckConnection(ctx context.Context) (*DeviceDetails, error) {
+	endpoint := client.baseURL + "/api/device"
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to build device request: %w", err)
+	}
+
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("device request failed: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return nil, fmt.Errorf("device request failed: %s", string(body))
+	}
+
 	var device DeviceDetails
-	if err := json.Unmarshal(body, &device); err != nil {
-		fmt.Println("Can not unmarshal JSON")
+	if err := json.NewDecoder(response.Body).Decode(&device); err != nil {
+		return nil, fmt.Errorf("unable to decode device response: %w", err)
 	}
 
-	fmt.Println(device)
-
+	return &device, nil
 }
 
-func constructLibraryURL(params LibraryQueryParams) (string, error) {
-	library_url := getRoutes(getBooxURL()).Library
-
-	u, err := url.Parse(library_url)
-
+func (client *BooxClient) GetLibraryTitles(ctx context.Context, params LibraryQueryParams) ([]string, error) {
+	queryURL, err := client.constructLibraryURL(params)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("error constructing URL: %w", err)
 	}
 
-	q := u.Query()
-	args := make(map[string]interface{})
-	args["limit"] = params.Limit
-	args["offset"] = params.Limit
-	args["sortBy"] = params.SortBy
-	args["order"] = params.Order
-	if params.LibraryUniqueID != "" {
-		args["libraryUniqueId"] = params.LibraryUniqueID
-	} else {
-		args["libraryUniqueID"] = nil
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error building request: %w", err)
 	}
 
-	argsJSON, err := json.Marshal(args)
-
+	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("error making HTTP request: %w", err)
 	}
+	defer response.Body.Close()
 
-	q.Set("args", string(argsJSON))
-	u.RawQuery = q.Encode()
-
-	return u.String(), nil
-
-}
-
-func getLibraryTitlesWithParams(params LibraryQueryParams) ([]string, error) {
-	queryURL, err := constructLibraryURL(params)
-	if err != nil {
-		return nil, fmt.Errorf("error constructing URL: %v", err)
-	}
-	resp, err := http.Get(queryURL)
-
-	if err != nil {
-		return nil, fmt.Errorf("error making HTTP request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %v", err)
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return nil, fmt.Errorf("unexpected status code: %d %s", response.StatusCode, string(body))
 	}
 
 	var libraryResp LibraryResponse
-	err = json.Unmarshal(body, &libraryResp)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling JSON %v", err)
+	if err := json.NewDecoder(response.Body).Decode(&libraryResp); err != nil {
+		return nil, fmt.Errorf("error unmarshaling JSON: %w", err)
 	}
 
-	var titles []string
-
+	titles := make([]string, 0, len(libraryResp.VisibleBookList)+len(libraryResp.VisibleLibraryList))
 	for _, book := range libraryResp.VisibleBookList {
 		titles = append(titles, book.Title)
 	}
@@ -180,62 +134,156 @@ func getLibraryTitlesWithParams(params LibraryQueryParams) ([]string, error) {
 	}
 
 	return titles, nil
-
 }
 
-func UploadFromFile(uploadURL string, filePath string) error {
-	filePath = "/Users/shivom/boox-uploader-cli/boox-uploader-cli/main/Testing Lifting Bodies at Edwards.pdf"
-	fileContent, err := os.ReadFile(filePath)
-	if err != nil {
-		log.Fatal(err)
+func (client *BooxClient) CreateFolder(ctx context.Context, parentID *string, title string) (string, error) {
+	endpoint := client.baseURL + "/api/library"
+	payload := FolderCreationRequest{
+		Parent: nil,
+		Name:   title,
+	}
+	if parentID != nil {
+		payload.Parent = *parentID
 	}
 
-	fileName := filepath.Base(filePath)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("error marshaling JSON: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("error making POST request: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("unexpected status code: %d %s", response.StatusCode, string(body))
+	}
+
+	var folderResponse FolderCreationResponse
+	if err := json.NewDecoder(response.Body).Decode(&folderResponse); err != nil {
+		return "", fmt.Errorf("error decoding response: %w", err)
+	}
+
+	return folderResponse.ID, nil
+}
+
+func (client *BooxClient) UploadFile(ctx context.Context, parentID, fileName string, fileData []byte) error {
+	endpoint := client.baseURL + "/api/library/upload"
 
 	body := &bytes.Buffer{}
-
 	writer := multipart.NewWriter(body)
 
 	part, err := writer.CreateFormFile("file", fileName)
 	if err != nil {
-		return fmt.Errorf("error creating form file %v", err)
+		return fmt.Errorf("unable to create form file: %w", err)
 	}
 
-	_, err = io.Copy(part, bytes.NewReader(fileContent))
+	if _, err := part.Write(fileData); err != nil {
+		return fmt.Errorf("unable to write file data: %w", err)
+	}
+
+	if parentID != "" {
+		writer.WriteField("parent", parentID)
+	}
+	writer.WriteField("name", fileName)
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("unable to finalize form: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
-		return fmt.Errorf("failed to copy file content %v", err)
+		return fmt.Errorf("unable to create upload request: %w", err)
 	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
 
-	err = writer.Close()
+	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("failed to close writer %v", err)
+		return fmt.Errorf("upload request failed: %w", err)
 	}
+	defer response.Body.Close()
 
-	req, err := http.NewRequest("POST", uploadURL, body)
-	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("upload failed: %d %s", response.StatusCode, string(body))
 	}
-
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	client := &http.Client{}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Failed to submit request %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %v", resp.Status)
-	}
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading response: %v", err)
-	}
-	fmt.Printf("Upload response: %s\n", string(responseBody))
 
 	return nil
+}
 
+func (client *BooxClient) RenameItem(ctx context.Context, idString, newName string) error {
+	endpoint := client.baseURL + "/api/library/rename"
+
+	payload := struct {
+		IDString string `json:"idString"`
+		File     string `json:"file"`
+		Name     string `json:"name"`
+	}{
+		IDString: idString,
+		File:     idString,
+		Name:     newName,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("error marshaling JSON: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("error sending request: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("unexpected status code: %d, body: %s", response.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+func (client *BooxClient) constructLibraryURL(params LibraryQueryParams) (string, error) {
+	libraryURL := client.baseURL + "/api/library"
+
+	u, err := url.Parse(libraryURL)
+	if err != nil {
+		return "", err
+	}
+
+	q := u.Query()
+	args := map[string]interface{}{
+		"limit":  params.Limit,
+		"offset": params.Offset,
+		"sortBy": params.SortBy,
+		"order":  params.Order,
+	}
+	if params.LibraryUniqueID != "" {
+		args["libraryUniqueId"] = params.LibraryUniqueID
+	}
+
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return "", err
+	}
+
+	q.Set("args", string(argsJSON))
+	u.RawQuery = q.Encode()
+
+	return u.String(), nil
 }
