@@ -1,4 +1,9 @@
 
 *.pdf
+<<<<<<< HEAD
 .DS_Store
 main/.env
+=======
+.env
+.DS_Store
+>>>>>>> main
