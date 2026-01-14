@@ -15,10 +15,3 @@
 ---
 
 
-
-[!hippo](https://github.com/user-attachments/assets/1843d7c9-61e4-4174-a5ef-70aa69b15372)
-[!hippo](https://github.com/user-attachments/assets/a2bbbd6c-4eb9-40f0-9b0e-78591af8763a)
-
-
-
-
