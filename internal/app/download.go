@@ -1,12 +1,18 @@
-package main
+package app
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
+	"strings"
+
+	"github.com/ssh-vom/boox-serve/internal/boox"
+	"github.com/ssh-vom/boox-serve/internal/providers/manga"
 )
 
 type TitleAndHash struct {
@@ -64,7 +70,7 @@ func (tracker *progressTracker) skip(steps int, message string) {
 	}
 }
 
-func DownloadAndUploadLibGen(ctx context.Context, booxClient *BooxClient, httpClient *http.Client, items []TitleAndHash) error {
+func DownloadAndUploadLibGen(ctx context.Context, booxClient *boox.Client, httpClient *http.Client, items []TitleAndHash) error {
 	for _, item := range items {
 		getURL := "https://cdn3.booksdl.org/get.php?" + item.Hash
 
@@ -94,7 +100,7 @@ func DownloadAndUploadLibGen(ctx context.Context, booxClient *BooxClient, httpCl
 	return nil
 }
 
-func DownloadAndUploadMangaChapters(ctx context.Context, booxClient *BooxClient, httpClient *http.Client, mangaTitle string, chapters []Chapter, updates chan<- ProgressUpdate) error {
+func DownloadAndUploadMangaChapters(ctx context.Context, booxClient *boox.Client, provider manga.Provider, mangaTitle string, chapters []manga.Chapter, updates chan<- ProgressUpdate) error {
 	if len(chapters) == 0 {
 		return fmt.Errorf("no chapters selected")
 	}
@@ -114,21 +120,11 @@ func DownloadAndUploadMangaChapters(ctx context.Context, booxClient *BooxClient,
 	var chapterErrors []error
 
 	for index, chapter := range chapters {
-		label := formatChapterLabel(chapter)
+		label := manga.FormatChapterLabel(chapter)
 		prefix := fmt.Sprintf("Chapter %d/%d: ", index+1, len(chapters))
 
 		tracker.message(prefix + "Downloading pages for " + label)
-		chapterDetails, err := FetchChapterDetails(ctx, httpClient, chapter.ID)
-		if err != nil {
-			if shouldSkipChapter(err) {
-				chapterErrors = append(chapterErrors, err)
-				tracker.skip(stepsPerChapter, prefix+"Skipped "+label)
-				continue
-			}
-			return fmt.Errorf("error fetching chapter details: %w", err)
-		}
-
-		images, err := DownloadChapterImages(ctx, httpClient, chapterDetails)
+		images, err := provider.DownloadChapterImages(ctx, chapter)
 		if err != nil {
 			if shouldSkipChapter(err) {
 				chapterErrors = append(chapterErrors, err)
@@ -141,7 +137,7 @@ func DownloadAndUploadMangaChapters(ctx context.Context, booxClient *BooxClient,
 
 		tracker.message(prefix + "Creating CBZ for " + label)
 		chapterName := sanitizeFileName(label)
-		cbzData, err := CreateCBZ(chapterName, images)
+		cbzData, err := createCBZ(chapterName, images)
 		if err != nil {
 			return fmt.Errorf("error creating CBZ file: %w", err)
 		}
@@ -163,5 +159,50 @@ func DownloadAndUploadMangaChapters(ctx context.Context, booxClient *BooxClient,
 }
 
 func shouldSkipChapter(err error) bool {
-	return errors.Is(err, errChapterMetadataMissing) || errors.Is(err, errChapterNoPages)
+	return errors.Is(err, manga.ErrChapterMetadataMissing) || errors.Is(err, manga.ErrChapterNoPages)
+}
+
+func createCBZ(chapterName string, images [][]byte) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+
+	for i, imgData := range images {
+		fileName := fmt.Sprintf("%s_page_%03d.jpg", chapterName, i+1)
+		writer, err := zipWriter.Create(fileName)
+		if err != nil {
+			return nil, fmt.Errorf("error creating zip entry %s: %w", fileName, err)
+		}
+
+		n, err := writer.Write(imgData)
+		if err != nil {
+			return nil, fmt.Errorf("error writing image data for %s: %w", fileName, err)
+		}
+		if n != len(imgData) {
+			return nil, fmt.Errorf("incomplete write for %s: wrote %d of %d bytes", fileName, n, len(imgData))
+		}
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		return nil, fmt.Errorf("error closing zip writer: %w", err)
+	}
+
+	cbzData := buf.Bytes()
+	if len(cbzData) == 0 {
+		return nil, fmt.Errorf("created CBZ file is empty")
+	}
+
+	return cbzData, nil
+}
+
+func sanitizeFileName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "untitled"
+	}
+
+	trimmed = strings.ReplaceAll(trimmed, "/", "-")
+	trimmed = strings.ReplaceAll(trimmed, "\\", "-")
+	trimmed = strings.Trim(trimmed, ". ")
+
+	return filepath.Clean(trimmed)
 }

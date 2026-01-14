@@ -1,14 +1,12 @@
-package main
+package ui
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -20,6 +18,11 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/ssh-vom/boox-serve/internal/app"
+	"github.com/ssh-vom/boox-serve/internal/boox"
+	"github.com/ssh-vom/boox-serve/internal/config"
+	"github.com/ssh-vom/boox-serve/internal/cover"
+	"github.com/ssh-vom/boox-serve/internal/providers/manga"
 )
 
 type appState int
@@ -52,7 +55,7 @@ func (item menuItem) Description() string { return item.description }
 func (item menuItem) FilterValue() string { return item.title }
 
 type mangaResultItem struct {
-	result MangaSearchResult
+	result manga.SearchResult
 }
 
 func (item mangaResultItem) Title() string { return item.result.Title }
@@ -65,42 +68,35 @@ func (item mangaResultItem) Description() string {
 func (item mangaResultItem) FilterValue() string { return item.result.Title }
 
 type chapterItem struct {
-	chapter Chapter
+	chapter manga.Chapter
 }
 
-func (item chapterItem) Title() string       { return formatChapterLabel(item.chapter) }
+func (item chapterItem) Title() string       { return manga.FormatChapterLabel(item.chapter) }
 func (item chapterItem) Description() string { return "" }
-func (item chapterItem) FilterValue() string { return formatChapterLabel(item.chapter) }
+func (item chapterItem) FilterValue() string { return manga.FormatChapterLabel(item.chapter) }
 
 type connectionResultMsg struct {
-	device *DeviceDetails
+	device *boox.DeviceDetails
 	err    error
 }
 
 type mangaSearchMsg struct {
-	results []MangaSearchResult
+	results []manga.SearchResult
 	err     error
 }
 
 type chaptersMsg struct {
-	chapters []Chapter
+	chapters []manga.Chapter
 	err      error
 }
 
 type downloadStartMsg struct {
-	updates <-chan ProgressUpdate
-}
-
-type coverImage struct {
-	filePath string
-	frames   []string
-	width    int
-	height   int
+	updates <-chan app.ProgressUpdate
 }
 
 type coverLoadedMsg struct {
 	url   string
-	image coverImage
+	image cover.Image
 	err   error
 }
 
@@ -111,9 +107,10 @@ type logMsg string
 type model struct {
 	state appState
 
-	config     Config
-	booxClient *BooxClient
-	httpClient *http.Client
+	config        config.Config
+	booxClient    *boox.Client
+	mangaProvider manga.Provider
+	buildDeps     BuildDependencies
 
 	menu         list.Model
 	textInput    textinput.Model
@@ -121,10 +118,10 @@ type model struct {
 	chapterList  list.Model
 	chapterMarks map[int]bool
 
-	selectedManga MangaSearchResult
-	chapters      []Chapter
+	selectedManga manga.SearchResult
+	chapters      []manga.Chapter
 
-	coverCache           map[string]coverImage
+	coverCache           map[string]cover.Image
 	coverErrors          map[string]string
 	coverLoadingURL      string
 	coverSelectedURL     string
@@ -138,7 +135,7 @@ type model struct {
 	progressTotal   int
 	progressMessage string
 	downloadErr     error
-	downloadUpdates <-chan ProgressUpdate
+	downloadUpdates <-chan app.ProgressUpdate
 
 	spinner spinner.Model
 
@@ -162,39 +159,14 @@ type settingsModel struct {
 	infoText  string
 }
 
-func main() {
-	verboseFlag := flag.Bool("verbose", false, "show verbose logs")
-	flag.Parse()
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	if *verboseFlag {
-		cfg.Verbose = true
-	}
-
-	httpClient := newHTTPClient()
-	var booxClient *BooxClient
-	var startupErr error
-
-	if err := cfg.Validate(); err != nil {
-		startupErr = err
-	} else {
-		booxClient, startupErr = NewBooxClient(cfg, httpClient)
-	}
-
-	model := newModel(cfg, booxClient, httpClient, startupErr)
-	program := tea.NewProgram(model, tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
-		os.Exit(1)
-	}
+type Dependencies struct {
+	BooxClient    *boox.Client
+	MangaProvider manga.Provider
 }
 
-func newModel(cfg Config, booxClient *BooxClient, httpClient *http.Client, startupErr error) model {
+type BuildDependencies func(cfg config.Config) (Dependencies, error)
+
+func NewModel(cfg config.Config, deps Dependencies, buildDeps BuildDependencies, startupErr error) model {
 	menu := newMenuList(0, 0)
 	textInput := newQueryInput()
 	resultsList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
@@ -208,14 +180,15 @@ func newModel(cfg Config, booxClient *BooxClient, httpClient *http.Client, start
 	model := model{
 		state:                stateChecking,
 		config:               cfg,
-		booxClient:           booxClient,
-		httpClient:           httpClient,
+		booxClient:           deps.BooxClient,
+		mangaProvider:        deps.MangaProvider,
+		buildDeps:            buildDeps,
 		menu:                 menu,
 		textInput:            textInput,
 		resultsList:          resultsList,
 		chapterList:          chapterList,
 		chapterMarks:         map[int]bool{},
-		coverCache:           map[string]coverImage{},
+		coverCache:           map[string]cover.Image{},
 		coverErrors:          map[string]string{},
 		coverLoadingURL:      "",
 		coverSelectedURL:     "",
@@ -271,7 +244,7 @@ func (model model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		model.progress.Width = progressWidth
 		if model.state == stateMangaResults {
-			model.coverCache = map[string]coverImage{}
+			model.coverCache = map[string]cover.Image{}
 			model.coverErrors = map[string]string{}
 			model.coverLoadingURL = ""
 			model.coverSelectedURL = ""
@@ -297,7 +270,7 @@ func (model model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return model, nil
 		}
 		model.resultsList = newMangaResultsList(msg.results, resultsListWidth(model.width), listHeight(model.height))
-		model.coverCache = map[string]coverImage{}
+		model.coverCache = map[string]cover.Image{}
 		model.coverErrors = map[string]string{}
 		model.coverLoadingURL = ""
 		model.coverSelectedURL = ""
@@ -324,7 +297,7 @@ func (model model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		model.progressTotal = 0
 		model.progressMessage = "Starting download"
 		return model, listenProgressCmd(model.downloadUpdates)
-	case ProgressUpdate:
+	case app.ProgressUpdate:
 		if msg.Err != nil {
 			model.downloadErr = msg.Err
 		}
@@ -349,7 +322,7 @@ func (model model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case coverLoadedMsg:
 		if msg.err != nil {
 			model.coverErrors[msg.url] = msg.err.Error()
-		} else if msg.image.filePath != "" {
+		} else if msg.image.FilePath != "" {
 			model.coverCache[msg.url] = msg.image
 		}
 		if model.coverLoadingURL == msg.url {
@@ -595,7 +568,7 @@ func (model *model) updateMangaQuery(msg tea.Msg) tea.Cmd {
 		}
 		model.state = stateMangaSearching
 		model.errorMessage = ""
-		return searchMangaCmd(model.httpClient, query)
+		return searchMangaCmd(model.mangaProvider, query)
 	}
 
 	return cmd
@@ -630,7 +603,7 @@ func (model *model) updateMangaResults(msg tea.Msg) tea.Cmd {
 		if selected, ok := model.resultsList.SelectedItem().(mangaResultItem); ok {
 			model.selectedManga = selected.result
 			model.state = stateMangaLoadingChapters
-			return fetchChaptersCmd(model.httpClient, selected.result.ID)
+			return fetchChaptersCmd(model.mangaProvider, selected.result.ID)
 		}
 	}
 
@@ -657,7 +630,7 @@ func (model *model) updateMangaChapters(msg tea.Msg) tea.Cmd {
 			}
 			model.errorMessage = ""
 			model.state = stateDownloading
-			return startDownloadCmd(model.booxClient, model.httpClient, model.selectedManga.Title, selected)
+			return startDownloadCmd(model.booxClient, model.mangaProvider, model.selectedManga.Title, selected)
 		}
 	}
 
@@ -692,11 +665,11 @@ func (model *model) updateSettings(msg tea.Msg) tea.Cmd {
 		case "enter":
 			return model.saveSettings()
 		case "c":
-			if err := clearCoverCache(); err != nil {
+			if err := cover.ClearCache(); err != nil {
 				model.settings.errorText = err.Error()
 				return nil
 			}
-			model.coverCache = map[string]coverImage{}
+			model.coverCache = map[string]cover.Image{}
 			model.coverErrors = map[string]string{}
 			model.coverLoadingURL = ""
 			model.coverSelectedURL = ""
@@ -722,18 +695,21 @@ func (model *model) saveSettings() tea.Cmd {
 		return nil
 	}
 
-	if err := SaveConfig(updated); err != nil {
+	if err := config.SaveConfig(updated); err != nil {
 		model.settings.errorText = err.Error()
 		return nil
 	}
 
 	model.config = updated
-	client, err := NewBooxClient(updated, model.httpClient)
-	if err != nil {
-		model.settings.errorText = err.Error()
-		return nil
+	if model.buildDeps != nil {
+		deps, err := model.buildDeps(updated)
+		if err != nil {
+			model.settings.errorText = err.Error()
+			return nil
+		}
+		model.booxClient = deps.BooxClient
+		model.mangaProvider = deps.MangaProvider
 	}
-	model.booxClient = client
 
 	model.settings.errorText = ""
 	if model.returnState == stateCheckFailed {
@@ -784,7 +760,7 @@ func (model model) mangaResultsView() string {
 	}
 	listSection = append(listSection, secondaryStyle.Render("Enter to select · esc to cancel"))
 
-	selected := MangaSearchResult{}
+	selected := manga.SearchResult{}
 	if item, ok := model.resultsList.SelectedItem().(mangaResultItem); ok {
 		selected = item.result
 	}
@@ -894,7 +870,7 @@ func supportsKittyGraphics() bool {
 	return strings.Contains(term, "ghostty") || strings.Contains(term, "kitty")
 }
 
-func (model model) mangaCoverPanel(result MangaSearchResult, width int) string {
+func (model model) mangaCoverPanel(result manga.SearchResult, width int) string {
 	if width < 20 {
 		width = 20
 	}
@@ -939,14 +915,14 @@ func (model model) mangaCoverPanel(result MangaSearchResult, width int) string {
 		return panelStyle.Width(width).Render(content)
 	}
 
-	cols, rows := coverRenderSize(width, image.width, image.height)
+	cols, rows := coverRenderSize(width, image.Width, image.Height)
 	placeholder := coverPlaceholder(rows, cols)
-	framePath := image.filePath
-	if model.coverTransitionURL == result.CoverURL && len(image.frames) > 0 && model.coverTransitionStep < len(image.frames) {
-		framePath = image.frames[model.coverTransitionStep]
+	framePath := image.FilePath
+	if model.coverTransitionURL == result.CoverURL && len(image.Frames) > 0 && model.coverTransitionStep < len(image.Frames) {
+		framePath = image.Frames[model.coverTransitionStep]
 	}
 
-	render, err := renderKittyImageFromFile(framePath, cols, rows, 0, 0)
+	render, err := cover.RenderKittyImageFromFile(framePath, cols, rows, 0, 0)
 
 	if err != nil {
 		lines = append(lines, warningStyle.Render(err.Error()))
@@ -986,7 +962,7 @@ func newQueryInput() textinput.Model {
 	return input
 }
 
-func newMangaResultsList(results []MangaSearchResult, width, height int) list.Model {
+func newMangaResultsList(results []manga.SearchResult, width, height int) list.Model {
 	items := make([]list.Item, 0, len(results))
 	for _, result := range results {
 		items = append(items, mangaResultItem{result: result})
@@ -1001,7 +977,7 @@ func newMangaResultsList(results []MangaSearchResult, width, height int) list.Mo
 	return resultList
 }
 
-func newChapterList(chapters []Chapter, width, height int) (list.Model, map[int]bool) {
+func newChapterList(chapters []manga.Chapter, width, height int) (list.Model, map[int]bool) {
 	items := make([]list.Item, 0, len(chapters))
 	for _, chapter := range chapters {
 		items = append(items, chapterItem{chapter: chapter})
@@ -1018,8 +994,8 @@ func newChapterList(chapters []Chapter, width, height int) (list.Model, map[int]
 	return chapterList, selected
 }
 
-func selectedChapters(items []list.Item, selected map[int]bool) []Chapter {
-	chapters := []Chapter{}
+func selectedChapters(items []list.Item, selected map[int]bool) []manga.Chapter {
+	chapters := []manga.Chapter{}
 	for index, item := range items {
 		if selected[index] {
 			chapterItem, ok := item.(chapterItem)
@@ -1032,7 +1008,7 @@ func selectedChapters(items []list.Item, selected map[int]bool) []Chapter {
 	return chapters
 }
 
-func checkConnectionCmd(client *BooxClient) tea.Cmd {
+func checkConnectionCmd(client *boox.Client) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return connectionResultMsg{err: errors.New("boox device not configured")}
@@ -1044,31 +1020,40 @@ func checkConnectionCmd(client *BooxClient) tea.Cmd {
 	}
 }
 
-func searchMangaCmd(httpClient *http.Client, query string) tea.Cmd {
+func searchMangaCmd(provider manga.Provider, query string) tea.Cmd {
 	return func() tea.Msg {
+		if provider == nil {
+			return mangaSearchMsg{err: errors.New("manga provider unavailable")}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		results, err := SearchManga(ctx, httpClient, query)
+		results, err := provider.Search(ctx, query)
 		return mangaSearchMsg{results: results, err: err}
 	}
 }
 
-func fetchChaptersCmd(httpClient *http.Client, mangaID string) tea.Cmd {
+func fetchChaptersCmd(provider manga.Provider, mangaID string) tea.Cmd {
 	return func() tea.Msg {
+		if provider == nil {
+			return chaptersMsg{err: errors.New("manga provider unavailable")}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		chapters, err := FetchChapters(ctx, httpClient, mangaID)
+		chapters, err := provider.FetchChapters(ctx, mangaID)
 		return chaptersMsg{chapters: chapters, err: err}
 	}
 }
 
-func fetchCoverCmd(httpClient *http.Client, coverURL string) tea.Cmd {
+func fetchCoverCmd(provider manga.Provider, coverURL string) tea.Cmd {
 	return func() tea.Msg {
 		if coverURL == "" {
 			return coverLoadedMsg{url: coverURL, err: errors.New("cover url missing")}
 		}
+		if provider == nil {
+			return coverLoadedMsg{url: coverURL, err: errors.New("manga provider unavailable")}
+		}
 
-		cached, ok, err := loadCachedCover(coverURL)
+		cached, ok, err := cover.LoadCachedCover(coverURL)
 		if err != nil {
 			return coverLoadedMsg{url: coverURL, err: err}
 		}
@@ -1079,27 +1064,12 @@ func fetchCoverCmd(httpClient *http.Client, coverURL string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+		body, err := provider.FetchCover(ctx, coverURL)
 		if err != nil {
-			return coverLoadedMsg{url: coverURL, err: fmt.Errorf("error building cover request: %w", err)}
-		}
-		addMangaDexHeaders(request)
-
-		response, err := httpClient.Do(request)
-		if err != nil {
-			return coverLoadedMsg{url: coverURL, err: fmt.Errorf("error fetching cover: %w", err)}
+			return coverLoadedMsg{url: coverURL, err: err}
 		}
 
-		body, err := io.ReadAll(response.Body)
-		response.Body.Close()
-		if err != nil {
-			return coverLoadedMsg{url: coverURL, err: fmt.Errorf("error reading cover: %w", err)}
-		}
-		if response.StatusCode != http.StatusOK {
-			return coverLoadedMsg{url: coverURL, err: fmt.Errorf("cover request failed: %s", response.Status)}
-		}
-
-		image, err := saveCoverImage(coverURL, body)
+		image, err := cover.SaveCoverImage(coverURL, body)
 		if err != nil {
 			return coverLoadedMsg{url: coverURL, err: err}
 		}
@@ -1108,29 +1078,34 @@ func fetchCoverCmd(httpClient *http.Client, coverURL string) tea.Cmd {
 	}
 }
 
-func startDownloadCmd(booxClient *BooxClient, httpClient *http.Client, mangaTitle string, chapters []Chapter) tea.Cmd {
+func startDownloadCmd(booxClient *boox.Client, provider manga.Provider, mangaTitle string, chapters []manga.Chapter) tea.Cmd {
 	return func() tea.Msg {
-		updates := make(chan ProgressUpdate, len(chapters)+2)
+		updates := make(chan app.ProgressUpdate, len(chapters)+2)
 		go func() {
 			if booxClient == nil {
-				updates <- ProgressUpdate{Done: true, Err: errors.New("boox connection unavailable")}
+				updates <- app.ProgressUpdate{Done: true, Err: errors.New("boox connection unavailable")}
+				close(updates)
+				return
+			}
+			if provider == nil {
+				updates <- app.ProgressUpdate{Done: true, Err: errors.New("manga provider unavailable")}
 				close(updates)
 				return
 			}
 			ctx := context.Background()
-			err := DownloadAndUploadMangaChapters(ctx, booxClient, httpClient, mangaTitle, chapters, updates)
-			updates <- ProgressUpdate{Done: true, Err: err}
+			err := app.DownloadAndUploadMangaChapters(ctx, booxClient, provider, mangaTitle, chapters, updates)
+			updates <- app.ProgressUpdate{Done: true, Err: err}
 			close(updates)
 		}()
 		return downloadStartMsg{updates: updates}
 	}
 }
 
-func listenProgressCmd(updates <-chan ProgressUpdate) tea.Cmd {
+func listenProgressCmd(updates <-chan app.ProgressUpdate) tea.Cmd {
 	return func() tea.Msg {
 		msg, ok := <-updates
 		if !ok {
-			return ProgressUpdate{Done: true}
+			return app.ProgressUpdate{Done: true}
 		}
 		return msg
 	}
@@ -1144,6 +1119,9 @@ func listenLogCmd(ch <-chan logMsg) tea.Cmd {
 
 func (model *model) requestCoverCmd() tea.Cmd {
 	if !model.supportsGraphics {
+		return nil
+	}
+	if model.mangaProvider == nil {
 		return nil
 	}
 
@@ -1165,7 +1143,7 @@ func (model *model) requestCoverCmd() tea.Cmd {
 	}
 
 	model.coverLoadingURL = coverURL
-	return fetchCoverCmd(model.httpClient, coverURL)
+	return fetchCoverCmd(model.mangaProvider, coverURL)
 }
 
 func (model *model) selectedCoverURL() string {
@@ -1187,9 +1165,9 @@ func (model *model) startCoverTransition(url string) tea.Cmd {
 	}
 	model.coverTransitionURL = url
 	model.coverTransitionStep = 0
-	transitionTotal := coverFadeFrames
-	if image, ok := model.coverCache[url]; ok && len(image.frames) > 0 {
-		transitionTotal = len(image.frames)
+	transitionTotal := cover.FadeFrames
+	if image, ok := model.coverCache[url]; ok && len(image.Frames) > 0 {
+		transitionTotal = len(image.Frames)
 	}
 	model.coverTransitionTotal = transitionTotal
 	return coverTransitionCmd()
@@ -1224,7 +1202,7 @@ func applySettingsFocus(settings settingsModel) settingsModel {
 	return settings
 }
 
-func newSettingsModel(cfg Config) settingsModel {
+func newSettingsModel(cfg config.Config) settingsModel {
 	inputs := make([]textinput.Model, 3)
 
 	urlInput := textinput.New()
@@ -1252,7 +1230,7 @@ func newSettingsModel(cfg Config) settingsModel {
 	return applySettingsFocus(settings)
 }
 
-func buildConfigFromSettings(cfg Config, inputs []textinput.Model) (Config, error) {
+func buildConfigFromSettings(cfg config.Config, inputs []textinput.Model) (config.Config, error) {
 	urlValue := strings.TrimSpace(inputs[0].Value())
 	ipValue := strings.TrimSpace(inputs[1].Value())
 	portValue := strings.TrimSpace(inputs[2].Value())

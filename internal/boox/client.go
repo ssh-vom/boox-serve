@@ -1,4 +1,4 @@
-package main
+package boox
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 type DeviceDetails struct {
@@ -53,25 +54,20 @@ type FolderCreationResponse struct {
 	ID string `json:"id"`
 }
 
-type BooxClient struct {
+type Client struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
-func NewBooxClient(cfg Config, httpClient *http.Client) (*BooxClient, error) {
-	baseURL, err := cfg.BaseURL()
-	if err != nil {
-		return nil, err
-	}
-
+func NewClient(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = newHTTPClient()
+		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 
-	return &BooxClient{baseURL: baseURL, httpClient: httpClient}, nil
+	return &Client{baseURL: baseURL, httpClient: httpClient}
 }
 
-func (client *BooxClient) CheckConnection(ctx context.Context) (*DeviceDetails, error) {
+func (client *Client) CheckConnection(ctx context.Context) (*DeviceDetails, error) {
 	endpoint := client.baseURL + "/api/device"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -97,7 +93,7 @@ func (client *BooxClient) CheckConnection(ctx context.Context) (*DeviceDetails, 
 	return &device, nil
 }
 
-func (client *BooxClient) GetLibraryTitles(ctx context.Context, params LibraryQueryParams) ([]string, error) {
+func (client *Client) GetLibraryTitles(ctx context.Context, params LibraryQueryParams) ([]string, error) {
 	queryURL, err := client.constructLibraryURL(params)
 	if err != nil {
 		return nil, fmt.Errorf("error constructing URL: %w", err)
@@ -136,7 +132,7 @@ func (client *BooxClient) GetLibraryTitles(ctx context.Context, params LibraryQu
 	return titles, nil
 }
 
-func (client *BooxClient) CreateFolder(ctx context.Context, parentID *string, title string) (string, error) {
+func (client *Client) CreateFolder(ctx context.Context, parentID *string, title string) (string, error) {
 	endpoint := client.baseURL + "/api/library"
 	payload := FolderCreationRequest{
 		Parent: nil,
@@ -176,7 +172,7 @@ func (client *BooxClient) CreateFolder(ctx context.Context, parentID *string, ti
 	return folderResponse.ID, nil
 }
 
-func (client *BooxClient) UploadFile(ctx context.Context, parentID, fileName string, fileData []byte) error {
+func (client *Client) UploadFile(ctx context.Context, parentID, fileName string, fileData []byte) error {
 	endpoint := client.baseURL + "/api/library/upload"
 
 	body := &bytes.Buffer{}
@@ -220,7 +216,7 @@ func (client *BooxClient) UploadFile(ctx context.Context, parentID, fileName str
 	return nil
 }
 
-func (client *BooxClient) RenameItem(ctx context.Context, idString, newName string) error {
+func (client *Client) RenameItem(ctx context.Context, idString, newName string) error {
 	endpoint := client.baseURL + "/api/library/rename"
 
 	payload := struct {
@@ -258,7 +254,7 @@ func (client *BooxClient) RenameItem(ctx context.Context, idString, newName stri
 	return nil
 }
 
-func (client *BooxClient) constructLibraryURL(params LibraryQueryParams) (string, error) {
+func (client *Client) constructLibraryURL(params LibraryQueryParams) (string, error) {
 	libraryURL := client.baseURL + "/api/library"
 
 	u, err := url.Parse(libraryURL)

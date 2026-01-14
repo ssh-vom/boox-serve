@@ -1,4 +1,4 @@
-module github.com/RealShivomSharma/manga-scraper-go
+module github.com/ssh-vom/boox-serve
 
 go 1.22.3
 
